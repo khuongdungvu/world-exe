@@ -1,0 +1,490 @@
+
+/* ============================================================================
+   9. TIMELINE CONTROLLER — updateScene(time) is the master score.
+   Each frame it derives, from the timeline time (plus the smoothed audio
+   bands), the state of every system: the active "space" (A: mandala and
+   constellation, B: the world-tree universe in which the eye later forms,
+   C: the terminal and the recursion), camera, geometry, tree growth/decay,
+   particle forces and targets, text, glitchAmount and post-processing.
+   Scenes hand over through morphs, particles, camera travel and darkness;
+   hard cuts happen only where the score demands them (14 s, 24 s, 30 s).
+   ========================================================================== */
+const SECTIONS = [[0, 'GENESIS'], [4, 'CONSTELLATION'], [8, 'WORLD TREE'], [12, 'TWELVE SIGNS'], [14, 'FREEZE / INIT'],
+  [18, 'THE EYE'], [20, 'GOD_PROCESS'], [24, 'RESTART?'], [28, 'RECURSION']];
+const EXPLOSIONS = [[18.0, 5], [21.0, 6], [21.45, 4], [21.9, 5], [22.6, 6], [23.2, 8]];
+
+class TimelineController {
+  constructor(app) {
+    this.a = app; this.prevT = -1; this.X = {};
+    this.S = { eyes: [], pu: ParticleEngine.defaults(), post: null, refDist: 3, nebula: 0, glitch: 0 };
+    const rng = makeRNG('life'), types = rng.shuffle([0, 1, 2, 3, 4, 5, 6]);
+    for (let k = 0; k < 7; k++) {     // seven micro-organisms arranged around the (future) eye
+      const ang = -Math.PI / 2 + (k + 0.5) * TAU / 7 + rng.range(-0.15, 0.15);
+      this.S.pu.life.set([Math.cos(ang) * 1.2, Math.sin(ang) * 0.64, rng.range(0.1, 0.18), types[k]], k * 4);
+    }
+  }
+  blink(T) { return T < 19.6 ? 0 : T < 19.76 ? Ease.inQuad(seg(T, 19.6, 19.76)) : T < 19.8 ? 1 : 1 - Ease.outCubic(seg(T, 19.8, 19.98)); }
+  zoomU(T) { return 3.0 * (0.5 - 0.5 * Math.cos(Math.PI * seg(T, 28.5, 29.7))) + 0.2 * seg(T, 29.5, 30.0); }   // ease in, three worlds out, settle into a slow drift
+  /** jump: re-seed the swarm for that moment and let its forces shape it (fixed-step warm-up) */
+  seek(T) {
+    const a = this.a, U = this.S.pu, zero = { bass: 0, mid: 0, high: 0 };
+    this.prevT = T;
+    if (T >= 28) this.textToParticles(); else a.particles.reset(T < 8 ? 'stars' : 'tree');
+    for (let i = 40; i >= 1; i--) { const t = Math.max(0, T - i / 60); this.particleParams(t, U, zero, 0); a.particles.step(1 / 60, U, t); }
+  }
+  updateScene(T, dt) {
+    const a = this.a, S = this.S, L = a.lines, P = a.points, cam = a.camera, au = a.react.v, AC = CONFIG.audio;
+    const fwd = this.prevT >= 0 && T >= this.prevT && T - this.prevT < 0.5;
+    const crossed = t => fwd && this.prevT < t && T >= t;
+    S.eyes.length = 0;
+    // ---- glitchAmount: ~0 in normal scenes, extreme from 21 to 24 s ----
+    let g = T > 7.8 && T < 8.05 ? 0.2 : 0;
+    if (T >= 20 && T < 24) {
+      g = 0.12 + 0.16 * seg(T, 20, 21) + 0.45 * Ease.inQuad(seg(T, 21, 22)) + 0.22 * seg(T, 22, 23) + 0.2 * seg(T, 23, 23.9);
+      if (T < 21.5 && rand1(Math.floor(T * 10), 9) < 0.25) g += 0.25;
+    }
+    if (T < 24 || T >= 28) g += au.high * AC.highGlitch * (g > 0.05 ? 1 : 0.25);         // HIGH → glitch
+    const ge = a.glitch.enabled ? g * CONFIG.glitchMaster : 0;
+    L.corrupt = P.corrupt = T >= 21 && T < 24 ? ge * 0.9 : 0;                         // layer 6: geometry corruption
+    L.corruptScale = P.corruptScale = 0.25;
+    L.seed = P.seed = Math.floor(T * 24);
+    // ---- camera (BASS → shake) ----
+    cam.aspect = a.W / a.H;
+    cam.update(T, { shake: au.bass * AC.bassShake * (T < 8 ? 0.35 : 1) + (T >= 21 && T < 24 ? 0.008 * ge : 0), glitch: ge, shakeFreq: 7 });
+    if (crossed(8.0)) a.particles.reset('tree');          // through the pupil: a new space
+    if (crossed(24.0)) a.glitch.clearHistory();           // hard cut to black
+    if (crossed(28.0)) this.textToParticles();            // YES dissolves into the matter of the next world
+    const bright = 1 + au.high * AC.highBrightness;       // HIGH → line brightness
+    if (T < 8) this.spaceA(T, dt, L, P, au, bright);
+    else if (T < 24) this.spaceB(T, L, P, au, bright, ge);
+    else if (T < 30) this.spaceC(T, L, P);
+    this.particleParams(T, S.pu, au, ge);
+    for (const [t, s] of EXPLOSIONS) if (crossed(t)) S.pu.explode = s;   // layer 9: particle explosions
+    this.texts(T, ge);
+    S.nebula = T < 8 ? 0.012 * smoothstep(4, 6, T) : T < 24 ? 0.05 * smoothstep(8.3, 10, T) * (T < 15 ? 1 : 0.35) : T > 28.4 && T < 30 ? 0.025 : 0;
+    // ---- post-processing extras ----
+    const X = this.X, fl = (t0, k, amp) => (T >= t0 ? amp * Math.exp(-(T - t0) * k) : 0);
+    X.echo = 0.62 * pulse(T, 7.0, 8.05, 0.3, 0.05) + 0.45 * pulse(T, 28.6, 29.75, 0.2, 0.3) + 0.35 * pulse(T, 17.0, 18.2, 0.3, 0.2);
+    X.echoZoom = T > 7 && T < 8.05 ? 0.985 : T > 28.6 && T < 29.75 ? 1.012 : T > 17 && T < 18.2 ? 1.006 : 0;
+    X.black = T >= 30 ? 1 : Ease.inOutCubic(seg(T, 29.55, 29.98));   // the ending: a slow fade, not a cut
+    X.lid = 0;            // (eyelid mask unused: the film fades out instead)
+    X.desat = T >= 14 && T < 15 ? 0.4 : T >= 15 && T < 18 ? 0.2 : 0;
+    X.sweep = T >= 14 && T < 15 ? 0.9 : 0;
+    X.sweepY = 1 - fract((T - 14) * 0.8);
+    X.warp = T > 7.4 && T < 8.05 ? 0.12 : 0;
+    X.flash = fl(8.0, 7, 0.5) + fl(18.0, 6, 0.7) + (T < 21 ? fl(20.0, 8, 0.5) : 0) + (T < 30 ? fl(28.6, 6, 0.6) : 0);
+    X.exposure = 1;
+    X.grainSeed = T >= 14 && T < 15 ? 336 : Math.floor(T * 24);   // even the grain freezes
+    X.oneFrame = crossed(19.76);                                  // the blink: one distorted frame
+    S.post = a.glitch.compute(T, T >= 24 && T < 28 ? 0 : g, X);
+    S.glitch = g;
+    this.prevT = T;
+    return S;
+  }
+  /* ---- SPACE A (0–8 s): point → ring → rings → sacred geometry → constellation → eye → dive ---- */
+  spaceA(T, dt, L, P, au, bright) {
+    const a = this.a, geo = a.geo, con = a.con, W = PAL.white;
+    this.S.refDist = 3;
+    if (T < 1.8) {   // the breathing point
+      const br = 0.5 + 0.5 * Math.sin((T - 0.3) * TAU * 0.85);
+      const I = smoothstep(0.25, 0.75, T) * (1 - smoothstep(1.05, 1.6, T)) * (1.6 + br * 1.4) * (1 + au.bass);
+      P.pt(0, 0, 0, W[0] * I, W[1] * I, W[2] * I, 2.2 + br * 1.6, SH_SOFT);
+    }
+    geo.audioRot += au.mid * CONFIG.audio.midRotation * dt * 0.3;     // MID → rotation
+    const sc = 1 + au.bass * CONFIG.audio.bassScale;                   // BASS → scale pulse
+    geo.draw(L, P, T, {
+      alpha: 1 - smoothstep(6.7, 7.4, T), figAlpha: 1 - smoothstep(4.0, 4.9, T), dissolve: seg(T, 4.0, 4.9), scale: sc, bright,
+      ringAlpha: k => (k === 7 ? lerp(1, 0.22, seg(T, 4.0, 5.0)) : 1 - smoothstep(4.0, 5.0, T)),
+    });
+    if (T >= 3.4) {
+      const theta = T < 6 ? 0.75 - 0.35 * smoothstep(4.0, 6.0, T) + au.mid * 0.04 : lerp(0.4, -4 * Math.PI, Ease.inOutCubic(seg(T, 6.0, 6.92)));
+      const aligned = smoothstep(6.6, 6.95, T);
+      con.updateA(T, { camD: a.camera.pos[2], theta, tilt: 0.25 * (1 - smoothstep(4.0, 6.9, T)),
+        depth: smoothstep(4.0, 5.2, T) * (1 - smoothstep(6.95, 7.35, T)), scale: 1, geoScale: sc });
+      con.drawEdges(L, { alpha: smoothstep(4.05, 4.8, T) * (0.8 + aligned * 0.9), maxLen: 1.6 });
+      con.drawNodes(P, T, { alpha: 1, bright: bright * (1 + aligned * 0.6), sizeMul: 1 });
+    }
+    const eI = smoothstep(6.8, 7.3, T);
+    if (eI > 0) this.S.eyes.push({ c: [0, 0, 0], u: [1, 0, 0], v: [0, 1, 0], scale: 1, half: [1.12, 0.66], open: 1, iris: 0.42, pupil: 0.16,
+      I: eI, red: 0, glitch: 0, hole: 1, sclera: 0.6, time: T, seed: 1 });
+  }
+  /* ---- SPACE B (8–24 s): tree, signs, freeze, life, consciousness, the eye, ERROR, collapse ---- */
+  spaceB(T, L, P, au, bright, g) {
+    const a = this.a, cam = a.camera, E = cam.eye, W = PAL.white;
+    this.S.refDist = T < 17.9 ? 8 : EYE_DIST;
+    let growth = 0.5 * Ease.outCubic(seg(T, 8.05, 9.0));
+    for (let b = 0; b < 4; b++) growth += 0.125 * Ease.outQuart(seg(T, 9.0 + b * 0.5, 9.45 + b * 0.5));   // one surge per beat
+    if (T < 11) growth = Math.min(1, growth + au.mid * CONFIG.audio.midGrowth * 0.08 * Math.sign(growth)); // MID → growth
+    let roots = Ease.outCubic(seg(T, 8.1, 9.6)), neural = Ease.inOutCubic(seg(T, 10.0, 11.6));
+    if (T >= 22) {   // decay: the same growth front, reversed and stuttering
+      const u = seg(T, 22.0, 23.0);
+      growth = u >= 1 ? 0 : 1 - clamp01(Math.floor(Ease.inCubic(u) * 16 + rand1(Math.floor(T * 24), 7) * 0.6) / 16);
+      roots = 1 - seg(T, 22.0, 22.9); neural *= 1 - seg(T, 22.0, 22.6);
+    }
+    let ta = smoothstep(8.0, 8.25, T);
+    if (T >= 15) ta = T < 16 ? lerp(1, 0.3, seg(T, 15.0, 15.6)) : lerp(0.3, 0.06, seg(T, 16.0, 17.5));
+    if (T >= 21) ta = T < 22 ? (rand1(Math.floor(T * 20), 3) < 0.4 ? 0.5 : 0.1) : 0.95 * (1 - seg(T, 23.0, 23.85));
+    a.tree.draw(L, P, { time: T < 14 ? T : T < 22 ? 14 : T, growth, rootGrowth: roots, neural, alpha: ta, decay: T >= 22 ? 1 : 0, sway: 1,
+      signals: T >= 10 && T < 22 ? 1 : 0, bright: bright * (1 + au.bass * 0.3), wave: ((Math.min(T, 14) - 8) % 1) * 10 });
+    const seedI = smoothstep(8.0, 8.15, T) * (1 - smoothstep(8.8, 9.3, T)) * 2.2;
+    if (seedI > 0) P.pt(0, 0.03, 0, W[0] * seedI, W[1] * seedI, W[2] * seedI, 3.2, SH_SOFT);
+    // ---- the twelve signs on a wheel around the crown ----
+    if (T >= 12.0 && T < 23.0) {
+      let al = T < 15 ? 1 : T < 16.6 ? 1 - seg(T, 15.0, 16.6) : 0;
+      if (T >= 21) al = (rand1(Math.floor(T * 16), 4) < 0.5 ? 0.7 : 0.15) * (1 - seg(T, 22.3, 23.0));
+      if (al > 0) {
+        const pr = [];
+        for (let k = 0; k < 12; k++) pr.push(Ease.inOutCubic(seg(T, 12.0 + k * 0.075, 12.32 + k * 0.075)));
+        let pulseV = 0, rot = 0.03 * Math.min(T, 14);
+        for (const tb of [13.0, 13.25, 13.5, 13.75]) {
+          if (T >= tb && T < 14) pulseV += Math.exp(-(T - tb) * 9);
+          rot -= TAU / 24 * Ease.outCubic(seg(T, tb, tb + 0.2));     // the wheel clicks forward on each hit
+        }
+        if (T < 14) pulseV = Math.min(1.3, pulseV + au.bass * 0.35);
+        const B = T < 14 ? cam.basis : cam.frozen, C = [0, 6.3, 0], back = V3.cross(B.right, B.up);
+        L.setXform(C, B.right, B.up, back); P.setXform(C, B.right, B.up, back);
+        a.sym.draw(L, P, T, { alpha: al, R: 4.3, size: 0.42, ringPr: Ease.inOutCubic(seg(T, 12.0, 12.95)), pr, pulse: pulseV, rot,
+          shatter: T > 21.5 ? (T - 21.5) * 1.2 : 0, flicker: 0, seed: Math.floor(T * 16) });
+        L.resetXform(); P.resetXform();
+      }
+    }
+    // ---- the giant eye (shader + halo + constellation + particles) ----
+    if (T >= 17.9 && T < 23.9) {
+      const open = 1 - this.blink(T);
+      let eI = smoothstep(18.0, 18.6, T);
+      if (T >= 21) eI *= (1 - seg(T, 21.6, 22.4)) * (rand1(Math.floor(T * 20), 6) < 0.3 + g * 0.4 ? 0.3 : 1);
+      if (eI > 0.002) this.S.eyes.push({ c: E.o, u: E.right, v: E.up, scale: EYE_SCALE, half: [1.12, 0.66], open, iris: 0.42,
+        pupil: 0.16 * (1 + 0.28 * smoothstep(20.0, 20.5, T)), I: eI, red: smoothstep(20.0, 20.2, T), glitch: g, hole: 1, sclera: 1,
+        time: T, seed: Math.floor(T * 24) });
+      const ha = smoothstep(18.1, 18.5, T) * (T < 21 ? 1 : 1 - seg(T, 21.3, 22.2));
+      if (ha > 0) {
+        L.setXform(E.o, E.x, E.y, E.z); P.setXform(E.o, E.x, E.y, E.z);
+        a.eye.drawHalo(L, P, T, { alpha: ha * bright, grow: seg(T, 18.1, 19.0), open, spin: 1 + au.mid });
+        L.resetXform(); P.resetXform();
+      }
+      a.con.updateEye(T, E, { open, form: T - 18.0, scatter: T > 21 ? 1.6 * (1 - Math.exp(-(T - 21) * 1.8)) : 0,
+        jitter: g * 0.6, depth: 0.12, seed: Math.floor(T * 24) });
+      if (T < 23.0) a.con.drawEdges(L, { alpha: smoothstep(18.2, 18.8, T) * 1.1, maxLen: 1.2 });
+      else a.con.drawRandomEdges(L, 160, 0.35 * (1 - seg(T, 23.5, 23.85)), Math.floor(T * 30));   // topology collapses
+      if (T < 23.85) a.con.drawNodes(P, T, { alpha: 1, bright, sizeMul: 1 });
+    }
+  }
+  /* ---- SPACE C (24–30 s): darkness, the question, rebirth, infinite recursion ---- */
+  spaceC(T, L, P) {
+    this.S.refDist = 3;
+    if (T < 28) return;
+    const W = PAL.white; if (T < 28.35) { const I = smoothstep(28.0, 28.08, T) * 2.2; P.pt(0, 0, 0, W[0] * I, W[1] * I, W[2] * I, 3, SH_SOFT); }
+    L.alpha = P.alpha = 1 - 0.7 * smoothstep(29.45, 29.9, T);        // the worlds dim ...
+    this.a.recursion.draw(L, P, T, this.zoomU(T));
+    L.alpha = P.alpha = 1;
+    if (T > 29.3) {                                                // ... leaving the seed of the next world: the opening point returns
+      const I = smoothstep(29.3, 29.6, T) * (1.6 + 0.9 * Math.sin((T - 29.3) * TAU * 0.85));
+      P.pt(0, 0, 0, W[0] * I, W[1] * I, W[2] * I, 3, SH_SOFT);
+    }
+  }
+  /* ---- particle forces & targets for every moment ---- */
+  particleParams(T, U, au, g) {
+    const cam = this.a.camera, E = cam.eye;
+    U.explode = 0; U.freeze = 0; U.jitter = 0; U.collapse = 0; U.swirl = 0; U.repulse = 0; U.red = 0; U.blink = 0;
+    U.xfOn = 0; U.streak = 0; U.mix = 0; U.cyan = 0.16; U.size = 1.6; U.noiseFreq = 0.6;
+    U.force = 1 + au.bass * CONFIG.audio.bassForce;                          // BASS → particle force
+    if (T < 8) {
+      U.modeA = U.modeB = 0; U.center = [0, 0, -4]; U.axis = [0, 0, 1]; U.attract = 0.7; U.damp = 1.5; U.noise = 0.08;
+      U.orbit = 0.1 + au.mid * CONFIG.audio.midOrbit * 0.15; U.refDist = 3;    // MID → orbital motion
+      U.alpha = 0.42 * smoothstep(3.8, 5.6, T) + 0.3 * smoothstep(7.0, 7.6, T); U.streak = 0.5 * seg(T, 7, 8);
+    } else if (T < 24) {
+      U.center = [0, 0, 0]; U.axis = [0, 1, 0]; U.refDist = 8;
+      if (T < 14) {
+        U.modeA = U.modeB = 1; U.attract = 0.6; U.damp = 1.2; U.noise = 0.25; U.noiseFreq = 0.35;
+        U.orbit = 0.25 + au.mid * CONFIG.audio.midOrbit * 0.4; U.alpha = 0.5 * smoothstep(8.2, 9.5, T);
+      } else if (T < 16) {
+        U.freeze = 1; U.alpha = lerp(0.5, 0.35, seg(T, 15, 16));
+      } else if (T < 18) {
+        const hh = EYE_DIST * Math.tan(cam.treeFov / 2);
+        U.fo = E.o; U.fx = V3.scale(E.right, hh); U.fy = V3.scale(E.up, hh); U.fz = V3.scale(E.back, hh);
+        U.center = E.o; U.axis = E.back; U.refDist = EYE_DIST;
+        if (T < 17) { U.modeA = 1; U.modeB = 2; U.mix = seg(T, 16.0, 16.45); U.attract = 16; U.damp = 6.5; U.noise = 0.1; U.alpha = 0.85; }
+        else {
+          const s = seg(T, 17, 18);
+          U.modeA = 2; U.modeB = 3; U.mix = Ease.inCubic(seg(T, 17.0, 17.75)); U.attract = 14 + 26 * s; U.damp = 6;
+          U.swirl = 3 * s; U.collapse = 2 * s; U.noise = 0.05; U.alpha = 0.85 + 0.5 * s;
+        }
+      } else {
+        U.modeA = U.modeB = 4; U.fo = E.o; U.fx = E.x; U.fy = E.y; U.fz = E.z; U.center = E.o; U.axis = E.back; U.refDist = EYE_DIST;
+        U.blink = this.blink(T);
+        if (T < 21) {
+          U.attract = lerp(0.5, 24, smoothstep(18.05, 18.7, T)); U.damp = 6; U.noise = 0.05 + 0.3 * seg(T, 20, 21);
+          U.jitter = 0.25 * seg(T, 20, 21); U.red = 0.05 * seg(T, 20, 20.5); U.alpha = 0.9;
+        } else {
+          U.attract = 0.6 * (1 - seg(T, 21, 22)); U.damp = 0.8; U.noise = 0.6 + g; U.jitter = 0.8 * g; U.red = 0.08;
+          U.alpha = (rand1(Math.floor(T * 20), 8) < 0.2 ? 0.25 : 0.9) * (1 - smoothstep(23.6, 23.95, T));
+        }
+      }
+    } else {
+      U.modeA = U.modeB = 5; U.fo = [0, 0, 0]; U.fx = [1, 0, 0]; U.fy = [0, 1, 0]; U.fz = [0, 0, 1];
+      U.center = [0, 0, 0]; U.axis = [0, 0, 1]; U.refDist = 3; U.size = 1.4;
+      if (T < 28) { U.freeze = 1; U.alpha = 0; }
+      else {
+        U.attract = 2 + 24 * smoothstep(28.0, 28.5, T); U.damp = 7; U.noise = 0.08; U.alpha = T < 30 ? 0.8 * (1 - 0.7 * smoothstep(29.45, 29.9, T)) : 0;
+        U.xfOn = 1; U.xf = this.a.recursion.particleXf(this.zoomU(T));
+      }
+    }
+  }
+  /* ---- the menu's own pixels become the particles of the next world ---- */
+  menuLayout() {
+    const a = this.a, px = a.text.px, adv = 7 * px, lh = 12 * px;
+    return { px, adv, lh, x0: a.W / 2 - 7 * adv, y0: a.H / 2 - lh * 1.5 };
+  }
+  textToParticles() {
+    const a = this.a, tx = a.text, m = this.menuLayout(), pix = [];
+    tx.block(null, ['RESTART WORLD?'], { x: m.x0, y: m.y0, left: true, top: true, collect: pix });
+    ['> YES', '  NO'].forEach((s, i) => { for (let c = 0; c < s.length; c++) tx.glyph(null, s[c], m.x0 + c * m.adv, m.y0 + m.lh * (1.6 + i * 1.1), m.px, PAL.white, 1, pix); });
+    const th = Math.tan(20 * DEG) * 3, asp = a.W / a.H, pts = [];
+    for (let i = 0; i < pix.length; i += 2) pts.push((pix[i] / a.W * 2 - 1) * th * asp, (1 - pix[i + 1] / a.H * 2) * th, 0);
+    a.particles.reset('points', { points: pts, jitter: 0.008 });
+  }
+  /* ---- typography: only at key moments ---- */
+  texts(T, g) {
+    const a = this.a, tx = a.text, UP = a.uiPoints, cx = a.W / 2, px = tx.px, adv = 7 * px, lh = 12 * px;
+    const W = PAL.white, G = PAL.gray, seed = Math.floor(T * 24);
+    if (T >= 24 && T < 28) {          // the terminal: cursor → question → NO → YES
+      const m = this.menuLayout();
+      if (T < 25) { if (Math.floor((T - 24) * 4) % 2 === 0) tx.glyph(UP, '_', m.x0, m.y0, px, W, 1); return; }
+      const rev = Math.floor((T - 25) * 30);
+      const nx = tx.block(UP, ['RESTART WORLD?'], { x: m.x0, y: m.y0, left: true, top: true, reveal: rev });
+      if (T < 25.55) { if (rev < 14 || Math.floor(T * 4) % 2 === 0) tx.glyph(UP, ' ', nx.x, nx.y, px, W, 0.85, null, true); return; }
+      const sel = T < 26 ? 0 : T < 27 ? 1 : 0;
+      ['YES', 'NO'].forEach((s, i) => {
+        const y = m.y0 + lh * (1.6 + i * 1.1), chosen = T >= 27.5 && i === 0 && Math.floor((T - 27.5) * 8) % 2 === 0;
+        if (sel === i) tx.glyph(UP, '>', m.x0, y, px, W, 1);
+        for (let c = 0; c < s.length; c++) tx.glyph(UP, s[c], m.x0 + (c + 2) * adv, y, px, W, sel === i ? 1 : 0.4, null, chosen);
+      });
+      return;
+    }
+    for (const c of TEXT_CUES) {
+      if (c.menu || T < c.t || T >= c.end) continue;
+      const rev = Math.floor((T - c.t) * c.cps), total = c.lines.reduce((s, l) => s + l.length, 0);
+      const colors = c.lines.map((l, i) => (i === 0 ? (c.red ? PAL.red : W) : G));
+      let corrupt = 0, jitter = 0, alpha = 1;
+      if (c.red && T > 21) { corrupt = Math.min(1, seg(T, 21, 21.8) * 0.8 + g * 0.2); jitter = g; alpha = rand1(Math.floor(T * 20), 12) < 0.3 ? 0.3 : 1; }
+      const r = tx.block(UP, c.lines, { x: cx, y: a.H * c.y, reveal: rev, colors, alpha, corrupt, jitter, seed });
+      if (rev <= total || Math.floor(T * 4) % 2 === 0) tx.glyph(UP, ' ', r.x, r.y, px, c.red ? PAL.red : W, 0.8 * alpha, null, true);
+      if (c.bar && T >= 15.35) {      // progress bar with a stalling, honest-looking curve → 100%
+        const p = seg(T, 15.4, 15.88);
+        const f = clamp01(p < 0.3 ? p * 1.2 : p < 0.55 ? 0.36 + (p - 0.3) * 0.2 : p < 0.7 ? 0.41 + (p - 0.55) * 3.3 : 0.9 + (p - 0.7) * 0.34);
+        const n = 32, step = px * 1.5, bx = cx - (n * step) / 2, by = r.y0 + 2 * lh + px;
+        for (let i = 0; i < n; i++) {
+          const k = i < Math.round(f * n) ? 1 : 0.12;
+          for (let q = 0; q < 3; q++) UP.pt(bx + i * step, by + q * px, -1, W[0] * k, W[1] * k, W[2] * k, px * 0.8, SH_SQUARE);
+        }
+        const pct = String(Math.floor(f * 100)).padStart(3, '0') + '%';
+        for (let i = 0; i < 4; i++) tx.glyph(UP, pct[i], bx + n * step + px * 2 + i * adv, by - 2 * px, px, G, 0.9);
+      }
+    }
+  }
+}
+
+/* ============================================================================
+   10. APP — boot, main loop, render passes, input, resize, HUD, self-test.
+   Render order per frame (into the HDR scene target):
+     background sky → eye quads (premultiplied; pupils write depth) →
+     world lines + points + GPU particles (additive, depth-tested so the
+     black-hole pupil occludes what lies behind it) → screen-space text →
+     GlitchEngine: bloom, glitch layers, tone-map, present.
+   Particles are simulated at a fixed 60 Hz step, independent of frame rate.
+   ========================================================================== */
+class App {
+  constructor() {
+    this.canvas = document.getElementById('view');
+    this.hud = document.getElementById('hud');
+    this.smoke = QS.has('smoke');
+    const r = this.r = new Renderer(this.canvas), q = CONFIG.qualities[CONFIG.quality];
+    this.lines = new LineBatch(r, 60000);
+    this.points = new PointBatch(r, 24000);
+    this.uiPoints = new PointBatch(r, 16000);
+    this.bgProg = r.program(FULLSCREEN_VS, BG_FS);
+    this.particles = new ParticleEngine(r, this.smoke ? 8192 : q.particles);
+    this.geo = new SacredGeometryEngine(makeRNG('geometry'));
+    this.con = new ConstellationEngine(makeRNG('constellation'), this.geo);
+    this.eye = new EyeGenerator(r);
+    this.tree = new LSystemWorldTree(makeRNG('tree'));
+    this.sym = new SymbolEngine(makeRNG('symbols'));
+    this.glitch = new GlitchEngine(r);
+    this.camera = new CameraSystem(new Noise(makeRNG('camera')));
+    this.text = new TextOverlaySystem();
+    this.recursion = new RecursionEngine(this.geo);
+    this.audio = new AudioEngine();
+    this.react = new AudioReactiveSystem();
+    this.timeline = new TimelineController(this);
+    this.uiCam = { view: M4.identity(new Float32Array(16)), proj: new Float32Array(16) };
+    this.tint = PAL.cyan.map((c, i) => c * 0.6 + PAL.gray[i] * 0.4);
+    this.T = START_T; this.playing = false; this.started = false; this.hudOn = false;
+    this.simAcc = 0; this.last = performance.now(); this.fps = 60; this.hudTick = 0;
+    this.resize();
+    addEventListener('resize', () => this.resize());
+    this.frame = this.frame.bind(this);
+    try {
+      this.audioDone = Soundtrack.render()
+        .then(b => { this.audio.buffer = b; this.audio.status = 'procedural ' + b.duration.toFixed(1) + 's'; if (this.playing) this.audio.play(this.T); })
+        .catch(e => { this.audio.status = 'error: ' + e.message; });
+    } catch (e) { this.audio.status = 'error: ' + e.message; this.audioDone = Promise.resolve(); }
+    addEventListener('keydown', e => this.key(e));
+    this.canvas.addEventListener('pointerdown', () => this.start());
+  }
+  key(e) {
+    if (e.repeat) return;
+    const k = e.code;
+    if (k === 'Space') e.preventDefault();
+    if (k === 'KeyS') { this.toggleHud(); return; }
+    if (!this.started) { if (k === 'Space' || k === 'Enter') this.start(); return; }
+    if (k === 'Space') this.togglePause();
+    else if (k === 'KeyR') { this.playing = true; document.body.classList.add('playing'); this.seek(0); }
+    else if (k === 'KeyG') this.glitch.enabled = !this.glitch.enabled;
+    else if (k === 'KeyA') this.react.enabled = !this.react.enabled;
+    else if (k === 'KeyM') this.audio.setMuted(!this.audio.muted);
+    else if (k === 'KeyF') { if (document.fullscreenElement) document.exitFullscreen(); else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {}); }
+    else if (/^Digit[1-9]$/.test(k)) this.seek(SECTIONS[Number(k.slice(5)) - 1][0]);
+  }
+  start() {
+    if (this.started) return;
+    this.started = true; this.playing = true;
+    document.body.classList.add('playing');
+    this.audio.init();
+    this.seek(START_T);
+  }
+  togglePause() {
+    this.playing = !this.playing;
+    document.body.classList.toggle('playing', this.playing);
+    if (this.playing) this.audio.play(this.T); else this.audio.stop();
+  }
+  seek(T) {
+    this.T = clamp(T, 0, CONFIG.duration);
+    this.timeline.seek(this.T);
+    this.glitch.clearHistory();
+    this.simAcc = 0;
+    if (this.playing) this.audio.play(this.T); else this.audio.stop();
+  }
+  resize() {
+    const q = CONFIG.qualities[CONFIG.quality], dpr = Math.min(window.devicePixelRatio || 1, q.maxDPR) * q.scale;
+    const w = this.smoke ? 640 : Math.max(160, Math.floor(innerWidth * dpr)), h = this.smoke ? 360 : Math.max(90, Math.floor(innerHeight * dpr));
+    this.canvas.width = w; this.canvas.height = h; this.W = w; this.H = h;
+    this.glitch.resize(w, h);
+    M4.ortho(this.uiCam.proj, 0, w, h, 0, -10, 10);
+    this.text.layout(w, h);
+  }
+  frame(now) {
+    requestAnimationFrame(this.frame);
+    const dt = clamp((now - this.last) / 1000, 0, 0.1);
+    this.last = now;
+    if (dt > 0) this.fps += (1 / dt - this.fps) * 0.05;
+    if (this.r.lost) return;
+    if (!this.started) { this.boot(now / 1000); return; }
+    if (this.playing) this.T = this.audio.playing ? Math.max(0, this.audio.time()) : this.T + dt;   // the audio clock is the master clock
+    if (CONFIG.loop && this.T >= CONFIG.duration + CONFIG.loopBlack) this.seek(0);               // the process continues
+    this.react.update(dt, this.audio.analyser, this.audio.ctx ? this.audio.ctx.sampleRate : 44100, this.playing && this.audio.playing);
+    this.step(this.T, this.playing ? dt : 0);
+    if (this.hudOn && ++this.hudTick % 8 === 0) this.updateHud();
+  }
+  step(T, dt) {
+    const S = this.timeline.updateScene(T, dt);
+    if (dt > 0) {
+      this.simAcc += dt;
+      let n = 0;
+      while (this.simAcc >= 1 / 60 && n < 4) { this.particles.step(1 / 60, S.pu, T); S.pu.explode = 0; this.simAcc -= 1 / 60; n++; }
+      if (n === 4) this.simAcc = 0;
+    }
+    if (S.post.skip) { this.lines.n = 0; this.points.n = 0; this.uiPoints.n = 0; this.glitch.present(); }   // layer 8: frame skipping
+    else this.render(S);
+  }
+  render(S) {
+    const r = this.r, gl = r.gl, G = this.glitch, cam = this.camera, res = [G.scene.w, G.scene.h], px = G.scene.h / 1080;
+    r.bind(G.scene);
+    gl.depthMask(true);                                  // GlitchEngine leaves depth writes disabled
+    gl.clearColor(0, 0, 0, 1); gl.clearDepth(1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+    const B = this.bgProg, u = B.u, cb = cam.basis;
+    gl.useProgram(B.p);
+    gl.uniform3fv(u.uBg, PAL.bg); gl.uniform3fv(u.uRight, cb.right); gl.uniform3fv(u.uUp, cb.up); gl.uniform3fv(u.uFwd, cb.fwd);
+    gl.uniform3fv(u.uTint, this.tint); gl.uniform1f(u.uTan, cam.tanHalf); gl.uniform1f(u.uAspect, cam.aspect);
+    gl.uniform1f(u.uNebula, S.nebula); gl.uniform1f(u.uTime, this.T);
+    r.fullscreen();
+    gl.enable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    for (const E of S.eyes) this.eye.draw(cam, E);
+    gl.depthMask(false); gl.blendFunc(gl.ONE, gl.ONE);
+    const o = { px, persp: true, refDist: S.refDist, near: 0.02 };
+    this.lines.flush(cam, res, o);
+    this.points.flush(cam, res, o);
+    this.particles.draw(cam, px, S.pu);
+    gl.disable(gl.DEPTH_TEST);
+    this.uiPoints.flush(this.uiCam, res, { px: 1, persp: false, refDist: 1, near: 0.01 });
+    gl.disable(gl.BLEND);
+    G.render(S.post);
+  }
+  boot(t) {
+    const tx = this.text, cx = this.W / 2, cy = this.H / 2, p = tx.px;
+    tx.block(this.uiPoints, ['WORLD.EXE'], { x: cx, y: cy - p * 7, alpha: 0.9 });
+    if (Math.floor(t * 1.6) % 2 === 0) tx.block(this.uiPoints, [this.audio.buffer ? 'CLICK TO EXECUTE' : 'LOADING AUDIO...'], { x: cx, y: cy + p * 7, colors: [PAL.gray], alpha: 0.8 });
+    this.camera.aspect = this.W / this.H;
+    this.camera.update(0, { shake: 0 });
+    this.render({ eyes: [], nebula: 0, refDist: 3, pu: { alpha: 0 }, post: this.glitch.compute(0, 0, { grainSeed: Math.floor(t * 24) }) });
+  }
+  updateHud() {
+    const T = this.T, s = SECTIONS.reduce((p, x) => (T >= x[0] ? x : p), SECTIONS[0]), v = this.react.v;
+    const bar = x => '#'.repeat(Math.round(clamp01(x) * 10)).padEnd(10, '.');
+    this.hud.textContent = [
+      'WORLD.EXE — THE LAST RENDER    seed ' + CONFIG.seed,
+      't ' + T.toFixed(2) + ' / ' + CONFIG.duration.toFixed(2) + '    [' + (SECTIONS.indexOf(s) + 1) + '] ' + s[1] + (this.playing ? '' : '    PAUSED'),
+      'fps ' + this.fps.toFixed(0) + '    ' + this.W + 'x' + this.H + '    ' + CONFIG.quality + '    particles ' + this.particles.n + '    ' + (this.r.hdr ? 'HDR' : '8-bit'),
+      'glitch ' + this.glitch.glitchAmount.toFixed(2) + (this.glitch.enabled ? '' : ' [OFF]') + '    audio-react ' + (this.react.enabled ? 'on' : 'OFF') + '    audio ' + this.audio.status + (this.audio.muted ? ' (muted)' : ''),
+      'bass ' + bar(v.bass) + '   mid ' + bar(v.mid) + '   high ' + bar(v.high),
+      'SPACE pause · R restart · G glitch · A audio-react · 1-9 sections · S info · M mute · F fullscreen',
+    ].join('\n');
+  }
+  toggleHud() { this.hudOn = !this.hudOn; this.hud.classList.toggle('on', this.hudOn); if (this.hudOn) this.updateHud(); }
+  /** ?smoke=1 — in-browser self-test: renders key moments of the timeline and reports errors / black frames */
+  runSmoke() {
+    const gl = this.r.gl, w = this.W, h = this.H, buf = new Uint8Array(w * h * 4), out = [];
+    const times = [0.6, 2.6, 3.8, 5.5, 6.95, 7.6, 9.5, 11.0, 13.2, 14.5, 15.7, 16.6, 17.6, 18.8, 19.77, 20.5, 21.6, 22.5, 23.4, 24.6, 26.2, 27.7, 28.5, 29.5, 29.95];
+    this.started = true; this.playing = true;
+    for (const t of times) {
+      try {
+        this.seek(Math.max(0, t - 0.1));
+        for (let i = 1; i <= 6; i++) this.step(t - 0.1 + i * (0.1 / 6), 0.1 / 6);
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        let sum = 0, lit = 0;
+        for (let i = 0; i < buf.length; i += 4) { const l = (buf[i] + buf[i + 1] + buf[i + 2]) / 765; sum += l; if (l > 0.12) lit++; }
+        const err = gl.getError(), lum = sum / (w * h);
+        out.push('t=' + t.toFixed(2).padStart(5) + '  ' + (lum < 0.004 && lit === 0 ? 'BLACK' : 'image') + '  lum ' + lum.toFixed(4) + '  lit ' + (100 * lit / (w * h)).toFixed(2) + '%' + (err ? '  GL_ERROR ' + err : ''));
+      } catch (e) { out.push('t=' + t.toFixed(2).padStart(5) + '  EXCEPTION ' + e.message); }
+    }
+    this.playing = false;
+    this.hud.className = 'on';
+    const head = 'WORLD.EXE SELF-TEST  ' + w + 'x' + h + '  ' + (this.r.hdr ? 'HDR' : '8-bit') + ' targets\n(t=0.6 is a tiny point and t=24.6 only a cursor: low "lit" there is expected)\n';
+    this.hud.textContent = head + out.join('\n') + '\naudio: ' + this.audio.status;
+    this.audioDone.then(() => { this.hud.textContent = head + out.join('\n') + '\naudio: ' + this.audio.status; });
+  }
+}
+
+/* ---- boot / error reporting: initialisation and shader errors are shown on screen ---- */
+function fatal(e) {
+  const h = document.getElementById('hud');
+  if (h.classList.contains('err')) return;
+  const msg = String((e && e.message) || e), lines = msg.split('\n'), src = lines.filter(l => /^\s*\d+ {2}/.test(l));
+  const m = /ERROR: \d+:(\d+)/.exec(msg), n = m ? Number(m[1]) : 0;
+  h.className = 'err';
+  h.textContent = 'WORLD.EXE could not start\n\n' + lines.filter(l => !/^\s*\d+ {2}/.test(l)).slice(0, 10).join('\n') +
+    (n ? '\n…\n' + src.slice(Math.max(0, n - 2), n + 1).join('\n') : '') +
+    '\n\nWebGL2 is required (current Chrome / Edge / Firefox / Safari 15+).';
+  console.error(e);
+}
+addEventListener('error', ev => fatal(ev.error || ev.message));
+let APP = null;
+try {
+  APP = new App();
+  if (APP.smoke) APP.runSmoke(); else requestAnimationFrame(APP.frame);
+} catch (e) { fatal(e); }
+</script>
+</body>
+</html>

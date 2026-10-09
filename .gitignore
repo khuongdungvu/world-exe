@@ -1,0 +1,9 @@
+# 视频等超大文件（GitHub 限制单文件不能超过 100MB）
+*.mov
+*.mp4
+
+# 临时与备份文件
+*.bak
+.DS_Store
+Thumbs.db
+node_modules/
